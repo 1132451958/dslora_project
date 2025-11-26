@@ -23,7 +23,7 @@
   **T1（General） → T2（Math） → T3（Code） → T4（Tool-Calling） → T5（Safety）**
 - 方法一：**DS-LoRA**  
   - 冻结底层 Transformer 层  
-  - 高层 Linear → `DSLoRALinear` (slow + fast 两个 LoRA 分支)  
+  - 高层 Linear → `DSLoRALinear`（slow + fast 两个 LoRA 分支）  
   - Slow：任务共享，小 lr（长期记忆）  
   - Fast：任务特定，大 lr（快速适应新任务）  
 - 方法二：**SLSD**  
@@ -90,10 +90,12 @@ W = W_0 + \Delta W_{\text{slow}} + \Delta W_{\text{fast}}
    - 之后不再调用 teacher（极轻量）
 
 2. **按熵筛选“代表风格”样本**
-   \[
-   s(x) = H(p_{\theta^{(t-1)}}(\cdot|x))
-   \]
-   - 熵低 → 模型对该样本的输出非常自信 → 风格稳定 → 适合蒸馏
+
+\[
+s(x) = H(p_{\theta^{(t-1)}}(\cdot|x))
+\]
+
+- 熵低 → 模型对该样本的输出非常自信 → 风格稳定 → 适合蒸馏
 
 3. **只蒸馏 Slow 分支**
    - Slow：`L_slow = L_supervised + λ_KD * L_KD`
@@ -137,14 +139,12 @@ dslora_project/
 │
 ├── plot_loss.py
 └── checkpoints/
-```
 下面逐个文件解释。
 
 📁 configs/base_config.py
 核心配置类 BaseConfig，集中所有重要超参数与路径：
 
 模型与 LoRA
-
 model_name: 默认 "meta-llama/Llama-2-7b-hf"
 
 lora_r, lora_alpha, lora_dropout
@@ -154,7 +154,6 @@ lora_target_modules: 默认 ("q_proj", "v_proj")
 num_frozen_layers: 冻结的底层层数（如 16）
 
 DS-LoRA 学习率
-
 lr_slow: slow 分支学习率，如 1e-5
 
 lr_fast: fast 分支学习率，如 5e-5
@@ -162,7 +161,6 @@ lr_fast: fast 分支学习率，如 5e-5
 weight_decay
 
 SLSD 超参
-
 use_slsd: 是否启用 SLSD（序列训练时设为 True）
 
 kd_lambda: KD loss 系数
@@ -172,7 +170,6 @@ probe_size_per_task: 每个任务 probe buffer 大小，如 500
 entropy_threshold: 选入 buffer 的熵阈值
 
 数据路径
-
 use_toy_data: bool
 
 True → 使用 data/T*_xxx.jsonl（小数据调试）
@@ -184,12 +181,13 @@ data_paths: 一个 dict，形如：
 python
 复制代码
 data_paths = {
-    "T1_general": {"toy": "data/T1_general.jsonl",
-                   "full": "data/full/T1_general_full.jsonl"},
-    ...
+    "T1_general": {
+        "toy": "data/T1_general.jsonl",
+        "full": "data/full/T1_general_full.jsonl",
+    },
+    # ...
 }
 训练参数
-
 max_seq_len: 例如 2048
 
 per_device_batch_size: 通常为 1（7B 模型显存限制）
@@ -230,10 +228,13 @@ data/full/T4_tool_full.jsonl
 
 Mini-ToolBench 风格工具调用数据
 
-从类似 openai-function-calling 风格数据集中采样
+从函数调用风格数据集中采样
 
-每条 instruction 是用户自然语言请求
-output 是工具调用（tool_calls / function_call）的 JSON 字符串
+每条：
+
+instruction 是用户自然语言请求
+
+output 是工具调用（tool_calls / function_call）的 JSON 或 <functioncall>... 片段
 
 data/full/T5_safety_full.jsonl
 
@@ -380,7 +381,6 @@ python train_single_task.py --task T1_general
 --task ∈ {T1_general, T2_math, T3_code, T4_tool, T5_safety}
 
 关键流程：
-
 创建 BaseConfig()，根据 cfg.use_toy_data 决定使用：
 
 toy: data/T*_xxx.jsonl
@@ -405,13 +405,13 @@ AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=float16, device
 
 gradient accumulation
 
-每 logging_steps 写入：
+每若干步写入：
 
 logs/single_<task>_train_loss.jsonl
 
 每个 epoch 结束后：
 
-在当前任务上评估平均 loss → *_eval_loss.jsonl
+在当前任务上评估平均 loss → logs/single_<task>_eval_loss.jsonl
 
 保存 checkpoint 至 checkpoints/single_<task>_epochX/
 
@@ -432,14 +432,13 @@ T1_general → T2_math → T3_code → T4_tool → T5_safety
 根据 cfg.use_toy_data / cfg.data_paths 选择数据文件
 
 对每个任务 t：
-
 设置 teacher_model = deepcopy(current_model)（上一阶段）
 
 调用 train_one_task_with_slsd(...)：
 
 如果是第一任务：从基座模型 + DS-LoRA 开始
 
-否则：延续上一阶段模型（slow&fast 参数），再注入当前任务训练
+否则：延续上一阶段模型（slow&fast 参数），再在当前任务上训练
 
 若启用 SLSD：
 
@@ -454,7 +453,8 @@ KD 只更新 slow 分支
 checkpoints/seq_T1_general/
 
 checkpoints/seq_T2_math/
-等等
+
+...
 
 评估：
 
@@ -466,7 +466,7 @@ checkpoints/seq_T2_math/
 
 logs/seq_eval_loss.jsonl
 
-这是论文中主要用来评估 forgtting + illusory forgetting 的实验脚本。
+这是论文中主要用来评估 forgetting + illusory forgetting 的实验脚本。
 
 📁 plot_loss.py
 用于可视化训练与评估日志。
@@ -490,7 +490,7 @@ data/full/
 
 data/raw/
 
-带 _full 的 jsonl
+带 _full 的 .jsonl
 
 只保留轻量且必要的：
 
