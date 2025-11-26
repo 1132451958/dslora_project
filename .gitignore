@@ -1,0 +1,15 @@
+# Ignore data folder
+data/
+
+# Ignore logs
+logs/
+
+# Ignore checkpoints anywhere
+**/checkpoint/
+**/checkpoints/
+checkpoint/
+checkpoints/
+
+# Common
+__pycache__/
+*.pyc
