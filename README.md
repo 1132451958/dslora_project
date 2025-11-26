@@ -60,7 +60,7 @@ SLSD 在保证训练效率的同时显著减少风格漂移。
 ---
 
 ## 📂 项目结构
-dslora_project/
+''' dslora_project/
 │
 ├── configs/
 │ └── base_config.py # 全局配置（路径、LoRA 参数、lr 等）
@@ -86,6 +86,7 @@ dslora_project/
 ├── plot_loss.py # loss 可视化脚本
 │
 └── checkpoints/ # 保存模型（自动生成）
+'''
 
 
 ## ⚙️ 环境安装
