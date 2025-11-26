@@ -1,15 +1,19 @@
-# Ignore data folder
-data/
-
-# Ignore logs
-logs/
-
-# Ignore checkpoints anywhere
-**/checkpoint/
-**/checkpoints/
-checkpoint/
-checkpoints/
-
-# Common
+# Python
 __pycache__/
 *.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training outputs
+logs/
+checkpoints/
+
+# Data
+data/*.pt
+data/*.bin
+data/*.arrow
+data/cache/
+data/hf_cache/
+!data/*.jsonl
+

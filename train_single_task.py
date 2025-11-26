@@ -23,6 +23,59 @@ TASK_TO_FILE = {
     "T5_safety": "data/T5_safety.jsonl",
 }
 
+def select_device():
+    """
+    选择一块“最空闲”的 GPU（按剩余显存）并打印信息。
+    - 如果某张卡 mem_get_info 出错（比如已经 OOM），则视为 free=0。
+    - 如果没有 GPU，则回退到 CPU。
+    """
+    if not torch.cuda.is_available():
+        print("[GPU SELECT] CUDA not available, using CPU.")
+        return torch.device("cpu")
+
+    num_devices = torch.cuda.device_count()
+    infos = []
+    best_idx = None
+    best_free = -1
+
+    for i in range(num_devices):
+        name = torch.cuda.get_device_name(i)
+        total_bytes = torch.cuda.get_device_properties(i).total_memory
+        total_gb = total_bytes / 1024 ** 3
+
+        try:
+            # 某些情况下（比如该 GPU 之前 OOM）mem_get_info 会直接抛错
+            free_bytes, _ = torch.cuda.mem_get_info(i)
+            free_gb = free_bytes / 1024 ** 3
+            used_gb = total_gb - free_gb
+        except RuntimeError as e:
+            print(f"[GPU SELECT] mem_get_info failed on cuda:{i} ({e}), treat free=0.")
+            free_bytes = 0
+            free_gb = 0.0
+            used_gb = total_gb
+
+        infos.append((i, name, total_gb, used_gb, free_gb))
+
+        if free_bytes > best_free:
+            best_free = free_bytes
+            best_idx = i
+
+    print("[GPU SELECT] Available GPUs:")
+    for i, name, total_gb, used_gb, free_gb in infos:
+        print(
+            f"  - cuda:{i} | {name} | "
+            f"total={total_gb:.1f} GB, used={used_gb:.1f} GB, free={free_gb:.1f} GB"
+        )
+
+    if best_idx is None:
+        # 理论上不会走到这里，但做个兜底
+        print("[GPU SELECT] All GPUs look bad, fallback to cuda:0")
+        best_idx = 0
+
+    device = torch.device(f"cuda:{best_idx}")
+    print(f"[GPU SELECT] Using cuda:{best_idx} ({infos[best_idx][1]})")
+    return device
+
 
 def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval_samples: int = 200):
     """简单评估：在给定数据集上计算平均 loss（NLL）。"""
@@ -79,7 +132,7 @@ def main():
     # 根据任务选择对应的数据文件
     cfg.train_file = TASK_TO_FILE[args.task]
 
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+    device = select_device()  # 自动选择空闲 GPU 或 CPU
     print("Using device:", device)
     print("Train task:", args.task)
     print("Train file:", cfg.train_file)
