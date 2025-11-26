@@ -137,6 +137,7 @@ dslora_project/
 │
 ├── plot_loss.py
 └── checkpoints/
+```
 下面逐个文件解释。
 
 📁 configs/base_config.py
