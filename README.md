@@ -60,7 +60,6 @@ SLSD 在保证训练效率的同时显著减少风格漂移。
 ---
 
 ## 📂 项目结构
-
 dslora_project/
 │
 ├── configs/
@@ -88,10 +87,6 @@ dslora_project/
 │
 └── checkpoints/ # 保存模型（自动生成）
 
-yaml
-复制代码
-
----
 
 ## ⚙️ 环境安装
 
