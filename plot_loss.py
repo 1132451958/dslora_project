@@ -44,26 +44,33 @@ def plot_seq_eval_loss():
 
     rows = load_jsonl(log_path)
 
-    # 画成：每个 eval_task 一条曲线，x = stage index
-    stages = sorted(list(set(r["stage"] for r in rows)))
-    tasks = sorted(list(set(r["eval_task"] for r in rows)))
+    # 支持老日志：如果没有 method 字段，默认为 ds_lora_slsd
+    for r in rows:
+        if "method" not in r:
+            r["method"] = "ds_lora_slsd"
 
+    stages = sorted(list(set(r["stage"] for r in rows)))
     stage_to_idx = {s: i for i, s in enumerate(stages)}
 
+    # (method, eval_task) -> xs, ys
+    curves = {}
+    for r in rows:
+        m = r["method"]
+        t = r["eval_task"]
+        key = (m, t)
+        if key not in curves:
+            curves[key] = {"xs": [], "ys": []}
+        curves[key]["xs"].append(stage_to_idx[r["stage"]])
+        curves[key]["ys"].append(r["loss"])
+
     plt.figure()
-    for t in tasks:
-        xs = []
-        ys = []
-        for r in rows:
-            if r["eval_task"] == t:
-                xs.append(stage_to_idx[r["stage"]])
-                ys.append(r["loss"])
-        if xs:
-            plt.plot(xs, ys, marker="o", label=t)
+    for (m, t), data in curves.items():
+        label = f"{m}-{t}"
+        plt.plot(data["xs"], data["ys"], marker="o", label=label)
 
     plt.xlabel("Stage (index)")
     plt.ylabel("Eval Loss")
-    plt.title("Seq Training: Eval Loss on Tasks")
+    plt.title("Seq Training: Eval Loss on Tasks (by method)")
     plt.xticks(list(range(len(stages))), stages, rotation=45)
     plt.legend()
     plt.grid(True)

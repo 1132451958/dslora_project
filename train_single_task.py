@@ -15,20 +15,10 @@ from utils_data import InstructionDataset, collate_fn
 from models.ds_lora import replace_with_ds_lora, get_ds_lora_param_groups
 
 
-TASK_TO_FILE = {
-    "T1_general": "data/T1_general.jsonl",
-    "T2_math": "data/T2_math.jsonl",
-    "T3_code": "data/T3_code.jsonl",
-    "T4_tool": "data/T4_tool.jsonl",
-    "T5_safety": "data/T5_safety.jsonl",
-}
-
+# =========================================
+# 自动选择空闲 GPU
+# =========================================
 def select_device():
-    """
-    选择一块“最空闲”的 GPU（按剩余显存）并打印信息。
-    - 如果某张卡 mem_get_info 出错（比如已经 OOM），则视为 free=0。
-    - 如果没有 GPU，则回退到 CPU。
-    """
     if not torch.cuda.is_available():
         print("[GPU SELECT] CUDA not available, using CPU.")
         return torch.device("cpu")
@@ -44,14 +34,12 @@ def select_device():
         total_gb = total_bytes / 1024 ** 3
 
         try:
-            # 某些情况下（比如该 GPU 之前 OOM）mem_get_info 会直接抛错
             free_bytes, _ = torch.cuda.mem_get_info(i)
             free_gb = free_bytes / 1024 ** 3
             used_gb = total_gb - free_gb
-        except RuntimeError as e:
-            print(f"[GPU SELECT] mem_get_info failed on cuda:{i} ({e}), treat free=0.")
+        except RuntimeError:
             free_bytes = 0
-            free_gb = 0.0
+            free_gb = 0
             used_gb = total_gb
 
         infos.append((i, name, total_gb, used_gb, free_gb))
@@ -67,22 +55,18 @@ def select_device():
             f"total={total_gb:.1f} GB, used={used_gb:.1f} GB, free={free_gb:.1f} GB"
         )
 
-    if best_idx is None:
-        # 理论上不会走到这里，但做个兜底
-        print("[GPU SELECT] All GPUs look bad, fallback to cuda:0")
-        best_idx = 0
-
     device = torch.device(f"cuda:{best_idx}")
-    print(f"[GPU SELECT] Using cuda:{best_idx} ({infos[best_idx][1]})")
+    print(f"[GPU SELECT] Using cuda:{best_idx}")
     return device
 
 
+# =========================================
+# 简单评估：平均 Token Loss
+# =========================================
 def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval_samples: int = 200):
-    """简单评估：在给定数据集上计算平均 loss（NLL）。"""
     model.eval()
     dataset = InstructionDataset(data_file, tokenizer, max_length=cfg.max_seq_len)
 
-    # 只取前 max_eval_samples 条做 eval，避免太慢
     if len(dataset) > max_eval_samples:
         from torch.utils.data import Subset
         dataset = Subset(dataset, list(range(max_eval_samples)))
@@ -95,7 +79,7 @@ def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval
     )
 
     total_loss = 0.0
-    total_tokens = 0
+    total_batches = 0
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Eval", leave=False):
@@ -105,54 +89,78 @@ def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-            # loss 是平均到所有非 -100 label 的 token 上的
-            loss = outputs.loss
-            bs = batch["input_ids"].size(0)
-            total_loss += loss.item() * bs
-            total_tokens += bs
+            total_loss += outputs.loss.item()
+            total_batches += 1
 
     model.train()
-    if total_tokens == 0:
-        return None
-    return total_loss / total_tokens
+    return total_loss / max(1, total_batches)
 
 
+# =========================================
+# 主训练逻辑
+# =========================================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--task",
         type=str,
-        choices=list(TASK_TO_FILE.keys()),
+        choices=["T1_general", "T2_math", "T3_code", "T4_tool", "T5_safety"],
         default="T1_general",
         help="选择要训练的任务",
     )
     args = parser.parse_args()
 
     cfg = BaseConfig()
-    # 根据任务选择对应的数据文件
-    cfg.train_file = TASK_TO_FILE[args.task]
 
-    device = select_device()  # 自动选择空闲 GPU 或 CPU
-    print("Using device:", device)
-    print("Train task:", args.task)
-    print("Train file:", cfg.train_file)
+    # ---- 使用新的 split 配置 ----
+    if cfg.use_toy_data:
+        data_key = "toy"
+    else:
+        data_key = cfg.train_split  # train / tiny / full 由 BaseConfig 控制
+
+    cfg.train_file = cfg.data_paths[args.task][data_key]
+    print(f"[DATA] Using {data_key} Data → {cfg.train_file}")
+
+    # ---- 自动选择 GPU ----
+    device = select_device()
 
     os.makedirs(cfg.save_dir, exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
-    # ===== 1. 加载 tokenizer & 模型 =====
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+    # =========================================
+    # 1. 加载 tokenizer & LLaMA 模型
+    # =========================================
+    print(f"[CONFIG] model_name = {cfg.model_name}")
+    print("[CHECK] Exists?", os.path.exists(cfg.model_name), "Is dir?", os.path.isdir(cfg.model_name))
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model_name,
+        use_fast=False,
+        local_files_only=True,  # 只用本地模型
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # dtype 选择：优先用 bfloat16（4090 支持），否则用 float16
+    if torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+        torch_dtype = torch.bfloat16
+        print("[DTYPE] Using bfloat16")
+    else:
+        torch_dtype = torch.float16
+        print("[DTYPE] Using float16")
+
+    print(f"[MODEL] Loading {cfg.model_name} ...")
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
-        torch_dtype=torch.float32,
+        torch_dtype=torch_dtype,
+        local_files_only=True,
     )
 
+    # LLaMA 常见操作：resize embedding 以适配 pad_token 等
     model.resize_token_embeddings(len(tokenizer))
+    model.to(device)
 
-    # 替换上层 Linear 为 DS-LoRA
+    # ---- 注入 DS-LoRA ----
     model = replace_with_ds_lora(
         model,
         target_modules=cfg.lora_target_modules,
@@ -162,12 +170,22 @@ def main():
         num_frozen_layers=cfg.num_frozen_layers,
     )
 
-    model.to(device)
+    # 只训练 LoRA 参数
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
     model.train()
 
-    # ===== 2. 准备数据 =====
+    # =========================================
+    # 2. 数据加载
+    # =========================================
     train_dataset = InstructionDataset(
-        cfg.train_file, tokenizer, max_length=cfg.max_seq_len
+        cfg.train_file,
+        tokenizer,
+        max_length=cfg.max_seq_len,
     )
 
     train_loader = DataLoader(
@@ -177,36 +195,35 @@ def main():
         collate_fn=lambda b: collate_fn(b, tokenizer.pad_token_id),
     )
 
-    # ===== 3. 优化器（slow & fast 两组参数）=====
+    # =========================================
+    # 3. 优化器 Slow/ Fast 参数组
+    # =========================================
     optim_groups, _, _ = get_ds_lora_param_groups(
         model,
         lr_slow=cfg.lr_slow,
         lr_fast=cfg.lr_fast,
         weight_decay=cfg.weight_decay,
     )
-
     optimizer = torch.optim.AdamW(optim_groups)
 
     total_steps = (
-        len(train_loader)
-        * cfg.num_epochs
-        // cfg.gradient_accumulation_steps
-        + 1
+        len(train_loader) * cfg.num_epochs // cfg.gradient_accumulation_steps + 1
     )
 
     print("Num training examples:", len(train_dataset))
     print("Total steps:", total_steps)
     print("Config:", asdict(cfg))
 
+    # =========================================
+    # 4. 训练循环
+    # =========================================
     global_step = 0
     model.zero_grad()
 
-    # 日志文件
     run_name = f"single_{args.task}"
-    train_log_path = os.path.join("logs", f"{run_name}_train_loss.jsonl")
-    eval_log_path = os.path.join("logs", f"{run_name}_eval_loss.jsonl")
+    train_log_path = f"logs/{run_name}_train_loss.jsonl"
+    eval_log_path = f"logs/{run_name}_eval_loss.jsonl"
 
-    # ===== 4. 训练循环 =====
     for epoch in range(cfg.num_epochs):
         pbar = tqdm(train_loader, desc=f"[{args.task}] Epoch {epoch+1}")
         running_loss = 0.0
@@ -222,6 +239,13 @@ def main():
             )
 
             loss = outputs.loss
+
+            # ---- nan / inf 检查，直接跳过这个 batch ----
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[WARN] Detected nan/inf loss at step {step}, skip this batch.")
+                optimizer.zero_grad()
+                continue
+
             loss = loss / cfg.gradient_accumulation_steps
             loss.backward()
 
@@ -229,12 +253,14 @@ def main():
             running_steps += 1
 
             if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                # --- 梯度裁剪，防止梯度爆炸 ---
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
 
-                # 记录一次 loss（还原到未除 grad_acc 的尺度）
-                full_loss = running_loss * cfg.gradient_accumulation_steps / running_steps
+                full_loss = running_loss * cfg.gradient_accumulation_steps / max(1, running_steps)
                 pbar.set_postfix({"loss": full_loss})
 
                 with open(train_log_path, "a", encoding="utf-8") as f:
@@ -247,9 +273,12 @@ def main():
                 running_loss = 0.0
                 running_steps = 0
 
-        # ===== 每个 epoch 结束后做一次简单评估 =====
-        eval_loss = evaluate_loss(model, tokenizer, cfg.train_file, cfg, device)
-        print(f"[{args.task}] Epoch {epoch+1} eval loss: {eval_loss}")
+        # ===== Eval =====
+        eval_key = cfg.eval_split
+        eval_file = cfg.data_paths[args.task].get(eval_key, cfg.train_file)
+
+        eval_loss = evaluate_loss(model, tokenizer, eval_file, cfg, device)
+        print(f"[{args.task}] Epoch {epoch+1} eval({eval_key}) loss: {eval_loss}")
 
         with open(eval_log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -257,8 +286,19 @@ def main():
                 "eval_loss": float(eval_loss),
             }) + "\n")
 
-        # 保存 checkpoint
+        # ===== Save checkpoint =====
         save_path = os.path.join(cfg.save_dir, f"{run_name}_epoch{epoch+1}")
+        os.makedirs(save_path, exist_ok=True)
+
+        # 修复 generation_config 中与 do_sample=False 冲突的参数，避免保存时报错
+        if hasattr(model, "generation_config") and model.generation_config is not None:
+            gc = model.generation_config
+            if getattr(gc, "do_sample", False) is False:
+                if hasattr(gc, "temperature"):
+                    gc.temperature = None
+                if hasattr(gc, "top_p"):
+                    gc.top_p = None
+
         model.save_pretrained(save_path)
         tokenizer.save_pretrained(save_path)
         print("Saved model to", save_path)

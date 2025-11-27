@@ -20,13 +20,7 @@ data/*.arrow
 data/cache/
 data/hf_cache/
 
-data/raw/
-data/full/
-data/full_*/
-data/huge/
-data/processed_full/
-data/*_full.jsonl
-
+data/
 # ✅ 只保留 5 个小的任务级 jsonl（论文实验配置用）
 !data/T1_general.jsonl
 !data/T2_math.jsonl
@@ -36,3 +30,5 @@ data/*_full.jsonl
 
 # 如果你有一个说明文件也想进 git，可以保留：
 !data/README.md
+
+pretrained_models/
