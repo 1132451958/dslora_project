@@ -6,19 +6,9 @@
   - test ：约 10%
   - tiny ：从 train 中再采样一小份（例如 1000 条），用于快速调参与 sanity check
 
-假设原始 full 文件为：
-  data/full/T1_general_full.jsonl
-  data/full/T2_math_full.jsonl
-  data/full/T3_code_full.jsonl
-  data/full/T4_tool_full.jsonl
-  data/full/T5_safety_full.jsonl
-
-输出文件放在：
-  data/split/T1_general_train.jsonl
-  data/split/T1_general_val.jsonl
-  data/split/T1_general_test.jsonl
-  data/split/T1_general_tiny.jsonl
-  ... 其他任务同理
+并在拆分前做一次简单的数据清洗：
+  - 丢弃 output 为空 / 只有空格 的样本
+  - 丢弃缺少 instruction/output 字段的脏样本
 """
 
 import os
@@ -55,6 +45,50 @@ def save_jsonl(path: str, rows: List[Dict]):
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
 
+def clean_and_filter(data: List[Dict]) -> List[Dict]:
+    """
+    简单清洗逻辑：
+      - 必须包含 instruction / output 字段
+      - output 去掉空白后不能为空字符串
+    这样可以极大减少 labels 全为 -100 导致 eval 时出现 NaN 的情况。
+    """
+    cleaned = []
+    dropped_missing = 0
+    dropped_empty_output = 0
+
+    for ex in data:
+        if not isinstance(ex, dict):
+            dropped_missing += 1
+            continue
+
+        if "instruction" not in ex or "output" not in ex:
+            dropped_missing += 1
+            continue
+
+        instr = str(ex["instruction"]).strip()
+        out = str(ex["output"]).strip()
+        inp = str(ex.get("input", ""))  # input 可以为空，但统一转成字符串
+
+        # 丢掉 output 为空的样本
+        if out == "":
+            dropped_empty_output += 1
+            continue
+
+        ex_clean = {
+            "instruction": instr,
+            "input": inp,
+            "output": out,
+        }
+        cleaned.append(ex_clean)
+
+    print(
+        f"[CLEAN] kept={len(cleaned)}, "
+        f"dropped_missing={dropped_missing}, "
+        f"dropped_empty_output={dropped_empty_output}"
+    )
+    return cleaned
+
+
 def split_one_task(task: str):
     full_path = os.path.join("data", "full", f"{task}_full.jsonl")
 
@@ -65,12 +99,16 @@ def split_one_task(task: str):
         print(f"[ERROR] Full file not found for {task}: {full_path}")
         return
 
-    data = load_jsonl(full_path)
+    raw_data = load_jsonl(full_path)
+    print(f"[INFO] Raw total examples: {len(raw_data)}")
+
+    # ---------- 数据清洗 ----------
+    data = clean_and_filter(raw_data)
     n = len(data)
-    print(f"[INFO] Total examples: {n}")
+    print(f"[INFO] After cleaning: {n} examples")
 
     if n == 0:
-        print("[WARN] Empty file, skip.")
+        print("[WARN] Empty file after cleaning, skip.")
         return
 
     rng = random.Random(RANDOM_SEED)
@@ -109,7 +147,7 @@ def split_one_task(task: str):
 
 
 def main():
-    print("=== Start splitting datasets (80/10/10 + tiny) ===")
+    print("=== Start splitting datasets (80/10/10 + tiny, with cleaning) ===")
     print(f"cwd = {os.getcwd()}")
     print(f"data/full exists? {os.path.isdir('data/full')}")
     if os.path.isdir("data/full"):
