@@ -27,6 +27,9 @@ data/huge/
 data/processed_full/
 data/*_full.jsonl
 
+# 🔴 新增：忽略所有拆分后的大数据集
+data/split/
+
 # ✅ 只保留 5 个小的任务级 jsonl（论文实验配置用）
 !data/T1_general.jsonl
 !data/T2_math.jsonl
@@ -34,7 +37,7 @@ data/*_full.jsonl
 !data/T4_tool.jsonl
 !data/T5_safety.jsonl
 
-# 如果你有一个说明文件也想进 git，可以保留：
 !data/README.md
 
+# 预训练权重也不进 git
 pretrained_models/
