@@ -6,9 +6,25 @@
   - test ：约 10%
   - tiny ：从 train 中再采样一小份（例如 1000 条），用于快速调参与 sanity check
 
+<<<<<<< HEAD
 并在拆分前做一次简单的数据清洗：
   - 丢弃 output 为空 / 只有空格 的样本
   - 丢弃缺少 instruction/output 字段的脏样本
+=======
+假设原始 full 文件为：
+  data/full/T1_general_full.jsonl
+  data/full/T2_math_full.jsonl
+  data/full/T3_code_full.jsonl
+  data/full/T4_tool_full.jsonl
+  data/full/T5_safety_full.jsonl
+
+输出文件放在：
+  data/split/T1_general_train.jsonl
+  data/split/T1_general_val.jsonl
+  data/split/T1_general_test.jsonl
+  data/split/T1_general_tiny.jsonl
+  ... 其他任务同理
+>>>>>>> 395136dc3b859244ef85234cd58ab3d60797141b
 """
 
 import os
@@ -45,6 +61,7 @@ def save_jsonl(path: str, rows: List[Dict]):
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
 
+<<<<<<< HEAD
 def clean_and_filter(data: List[Dict]) -> List[Dict]:
     """
     简单清洗逻辑：
@@ -89,6 +106,8 @@ def clean_and_filter(data: List[Dict]) -> List[Dict]:
     return cleaned
 
 
+=======
+>>>>>>> 395136dc3b859244ef85234cd58ab3d60797141b
 def split_one_task(task: str):
     full_path = os.path.join("data", "full", f"{task}_full.jsonl")
 
@@ -99,6 +118,7 @@ def split_one_task(task: str):
         print(f"[ERROR] Full file not found for {task}: {full_path}")
         return
 
+<<<<<<< HEAD
     raw_data = load_jsonl(full_path)
     print(f"[INFO] Raw total examples: {len(raw_data)}")
 
@@ -109,6 +129,14 @@ def split_one_task(task: str):
 
     if n == 0:
         print("[WARN] Empty file after cleaning, skip.")
+=======
+    data = load_jsonl(full_path)
+    n = len(data)
+    print(f"[INFO] Total examples: {n}")
+
+    if n == 0:
+        print("[WARN] Empty file, skip.")
+>>>>>>> 395136dc3b859244ef85234cd58ab3d60797141b
         return
 
     rng = random.Random(RANDOM_SEED)
@@ -147,7 +175,11 @@ def split_one_task(task: str):
 
 
 def main():
+<<<<<<< HEAD
     print("=== Start splitting datasets (80/10/10 + tiny, with cleaning) ===")
+=======
+    print("=== Start splitting datasets (80/10/10 + tiny) ===")
+>>>>>>> 395136dc3b859244ef85234cd58ab3d60797141b
     print(f"cwd = {os.getcwd()}")
     print(f"data/full exists? {os.path.isdir('data/full')}")
     if os.path.isdir("data/full"):

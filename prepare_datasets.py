@@ -14,6 +14,8 @@ import os
 import json
 from datasets import load_dataset
 
+# ------------ 目录准备 ------------
+
 os.makedirs("data/full", exist_ok=True)
 
 
@@ -21,6 +23,7 @@ def save_jsonl(path, rows):
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    print(f"[OK] Saved {len(rows)} rows → {path}")
     print(f"[OK] Saved {len(rows)} rows → {path}")
 
 
@@ -48,6 +51,7 @@ def build_T1_general_full():
         })
 
     save_jsonl("data/full/T1_general_full.jsonl", rows)
+    save_jsonl("data/full/T1_general_full.jsonl", rows)
 
 
 # ======================================================
@@ -64,6 +68,8 @@ def build_T2_math_full():
             "input": ex["question"],
             "output": ex["answer"],
         })
+
+    save_jsonl("data/full/T2_math_full.jsonl", rows)
 
     save_jsonl("data/full/T2_math_full.jsonl", rows)
 

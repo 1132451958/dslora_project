@@ -28,7 +28,6 @@ data/
 !data/T4_tool.jsonl
 !data/T5_safety.jsonl
 
-# 如果你有一个说明文件也想进 git，可以保留：
 !data/README.md
 
 pretrained_models/

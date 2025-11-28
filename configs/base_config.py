@@ -11,9 +11,29 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 本地 LLaMA-2-7B HF 模型目录
 LOCAL_LLAMA_PATH = os.path.join(PROJECT_ROOT, "pretrained_models", "llama2-7b-hf")
 
+import os
+from dataclasses import dataclass, field
+from typing import Dict, Tuple
+
+# =======================
+# 项目根目录 & 本地模型路径
+# =======================
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# 本地 LLaMA-2-7B HF 模型目录
+LOCAL_LLAMA_PATH = os.path.join(PROJECT_ROOT, "pretrained_models", "llama2-7b-hf")
+
 
 @dataclass
 class BaseConfig:
+    # =======================
+    # 模型名称（本地路径）
+    # =======================
+    model_name: str = LOCAL_LLAMA_PATH
+
+    # =======================
+    # LoRA / DS-LoRA 配置
+    # =======================
     # =======================
     # 模型名称（本地路径）
     # =======================
@@ -27,7 +47,15 @@ class BaseConfig:
     lora_dropout: float = 0.05
     # 对 LLaMA 系模型：q_proj / v_proj 是常见注入位置
     lora_target_modules: Tuple[str, ...] = ("q_proj", "v_proj")
+    # 对 LLaMA 系模型：q_proj / v_proj 是常见注入位置
+    lora_target_modules: Tuple[str, ...] = ("q_proj", "v_proj")
 
+    # 冻结前 N 层（LLaMA-2-7B 共 32 层）
+    num_frozen_layers: int = 16
+
+    # DS-LoRA 学习率（单任务 / DS-LoRA 使用）
+    lr_slow: float = 5e-6
+    lr_fast: float = 2e-5
     # 冻结前 N 层（LLaMA-2-7B 共 32 层）
     num_frozen_layers: int = 16
 
@@ -37,7 +65,9 @@ class BaseConfig:
     weight_decay: float = 0.01
 
     # =======================
+    # =======================
     # SLSD 相关
+    # =======================
     # =======================
     use_slsd: bool = False
     kd_lambda: float = 0.5
@@ -110,6 +140,7 @@ class BaseConfig:
     # =======================
     max_seq_len: int = 1024
     per_device_batch_size: int = 1
+    gradient_accumulation_steps: int = 16
     gradient_accumulation_steps: int = 16
     num_epochs: int = 1
     logging_steps: int = 10
