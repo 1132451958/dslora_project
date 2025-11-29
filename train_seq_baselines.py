@@ -1,4 +1,3 @@
-# train_seq_baselines.py
 """
 顺序多任务基线训练脚本：
 - Seq-LoRA
@@ -27,6 +26,29 @@ from models.lora_simple import (
     mark_only_lora_as_trainable,
     get_lora_param_groups,
 )
+
+
+# ======================================================
+# NaN / Inf 检查工具
+# ======================================================
+def check_nan(loss, model, task_name, method, global_step):
+    """
+    检查 loss 和梯度中是否存在 NaN。
+    - 在 backward 之后调用（此时梯度已计算）
+    - 如发现 NaN，返回 True；否则 False。
+    """
+    # loss 本身是 NaN
+    if torch.isnan(loss):
+        print(f"[NaN] Loss is NaN | task={task_name}, method={method}, step={global_step}")
+        return True
+
+    # 检查梯度是否有 NaN
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is not None and torch.isnan(p.grad).any():
+            print(f"[NaN] Grad is NaN in {name} | task={task_name}, method={method}, step={global_step}")
+            return True
+
+    return False
 
 
 # ======================================================
@@ -101,6 +123,12 @@ def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval
     model.eval()
     dataset = InstructionDataset(data_file, tokenizer, max_length=cfg.max_seq_len)
 
+    # 空数据返回 NaN，避免误认为是 0
+    if len(dataset) == 0:
+        print(f"[Eval WARNING] dataset is EMPTY: {data_file}, return NaN loss.")
+        model.train()
+        return float("nan")
+
     if len(dataset) > max_eval_samples:
         from torch.utils.data import Subset
 
@@ -119,16 +147,32 @@ def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"Eval {os.path.basename(data_file)}", leave=False):
             batch = {k: v.to(device) for k, v in batch.items()}
+
+            # 若 labels 全为 -100，则跳过这一 batch
+            if (batch["labels"] != -100).sum() == 0:
+                continue
+
             outputs = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-            total_loss += outputs.loss.item()
+            loss = outputs.loss
+
+            # 如果 loss 非有限值，跳过
+            if not torch.isfinite(loss):
+                print(f"[Eval WARNING] Non-finite loss={loss.item()} in {data_file}, skip batch.")
+                continue
+
+            total_loss += loss.item()
             total_batches += 1
 
     model.train()
-    return total_loss / max(1, total_batches)
+    if total_batches == 0:
+        print(f"[Eval WARNING] No valid batches for {data_file}, return NaN.")
+        return float("nan")
+
+    return total_loss / total_batches
 
 
 # ======================================================
@@ -185,6 +229,11 @@ def compute_ewc_state(model, tokenizer, data_file, cfg: BaseConfig, device, max_
     model.eval()
     dataset = InstructionDataset(data_file, tokenizer, max_length=cfg.max_seq_len)
 
+    if len(dataset) == 0:
+        print(f"[EWC WARNING] Empty dataset for Fisher: {data_file}")
+        model.train()
+        return None
+
     if len(dataset) > max_samples:
         from torch.utils.data import Subset
 
@@ -202,6 +251,10 @@ def compute_ewc_state(model, tokenizer, data_file, cfg: BaseConfig, device, max_
     sample_count = 0
 
     for batch in tqdm(loader, desc=f"[EWC] Fisher on {os.path.basename(data_file)}", leave=False):
+        # 若 labels 全为 -100，跳过
+        if (batch["labels"] != -100).sum() == 0:
+            continue
+
         sample_count += batch["input_ids"].size(0)
         model.zero_grad()
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -226,8 +279,13 @@ def compute_ewc_state(model, tokenizer, data_file, cfg: BaseConfig, device, max_
         if sample_count >= max_samples:
             break
 
+    if sample_count == 0:
+        print(f"[EWC WARNING] No valid samples for Fisher in {data_file}")
+        model.train()
+        return None
+
     for name in fisher:
-        fisher[name] /= max(1, sample_count)
+        fisher[name] /= sample_count
 
     model.train()
     print(f"[EWC] Collected fisher for {len(fisher)} tensors")
@@ -315,6 +373,10 @@ def train_one_task(
     # 2. 数据加载
     # --------------------------------------------------
     dataset = InstructionDataset(train_file, tokenizer, max_length=cfg.max_seq_len)
+    if len(dataset) == 0:
+        print(f"[Train WARNING] Empty train dataset for {task_name}, skip training.")
+        return model, tokenizer, replay_buffer, ewc_prev
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.per_device_batch_size,
@@ -350,6 +412,7 @@ def train_one_task(
 
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) for k, v in batch.items()}
+
             outputs = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -374,8 +437,25 @@ def train_one_task(
                 loss_rep = out_rep.loss
                 loss = loss + replay_lambda * loss_rep
 
+            # ---------- 1) 跳过 labels 全为 -100 的 batch ----------
+            if (batch["labels"] != -100).sum() == 0:
+                print(f"[WARN] All labels=-100 | skip batch | task={task_name}, method={method}")
+                continue
+
+            # ---------- 2) loss 是否为有限值（非 NaN/inf） ----------
+            if not torch.isfinite(loss):
+                print(f"[WARN] Non-finite loss={loss.item()} | skip batch | task={task_name}, method={method}, step={global_step}")
+                continue
+
+            # 梯度累积缩放
             loss = loss / cfg.gradient_accumulation_steps
             loss.backward()
+
+            # ---------- 3) NaN 检查（梯度已计算） ----------
+            if check_nan(loss, model, task_name, method, global_step):
+                print(f"[NaN] Skip batch | task={task_name}, method={method}, step={global_step}")
+                optimizer.zero_grad()
+                continue
 
             # 梯度裁剪（只对可训练参数）
             torch.nn.utils.clip_grad_norm_(
@@ -510,6 +590,10 @@ def main():
             replay_buffer=replay_buffer,
             ewc_prev=ewc_prev,
         )
+
+        if current_model is None:
+            print(f"[WARN] Model is None after training {task_name}, skip to next.")
+            continue
 
         # ------------------------------
         # 保存阶段模型

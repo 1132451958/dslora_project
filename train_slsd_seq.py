@@ -21,6 +21,27 @@ from models.ds_lora import replace_with_ds_lora, get_ds_lora_param_groups
 
 
 # ======================================================
+# NaN / Inf 检查工具
+# ======================================================
+def check_nan(loss, model, task_name, global_step):
+    """
+    检查 loss 和梯度中是否存在 NaN。
+    - 在 backward 之后调用（此时梯度已计算）
+    - 如发现 NaN，返回 True；否则 False。
+    """
+    if torch.isnan(loss):
+        print(f"[NaN] Loss is NaN | task={task_name}, step={global_step}")
+        return True
+
+    for name, p in model.named_parameters():
+        if p.requires_grad and p.grad is not None and torch.isnan(p.grad).any():
+            print(f"[NaN] Grad is NaN in {name} | task={task_name}, step={global_step}")
+            return True
+
+    return False
+
+
+# ======================================================
 # GPU 选择函数
 # ======================================================
 def select_device():
@@ -57,11 +78,16 @@ def select_device():
 
 
 # ======================================================
-# Evaluate
+# Evaluate（加了空数据、全 -100、非有限值处理）
 # ======================================================
 def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval_samples=200):
     model.eval()
     dataset = InstructionDataset(data_file, tokenizer, max_length=cfg.max_seq_len)
+
+    if len(dataset) == 0:
+        print(f"[Eval WARNING] dataset is EMPTY: {data_file}, return NaN loss.")
+        model.train()
+        return float("nan")
 
     if len(dataset) > max_eval_samples:
         from torch.utils.data import Subset
@@ -80,16 +106,31 @@ def evaluate_loss(model, tokenizer, data_file, cfg: BaseConfig, device, max_eval
     with torch.no_grad():
         for batch in tqdm(loader, desc=f"Eval {os.path.basename(data_file)}", leave=False):
             batch = {k: v.to(device) for k, v in batch.items()}
+
+            # 如果这一 batch 所有 labels 都是 -100（没监督 token），跳过
+            if (batch["labels"] != -100).sum() == 0:
+                continue
+
             outputs = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-            total_loss += outputs.loss.item()
+            loss = outputs.loss
+
+            if not torch.isfinite(loss):
+                print(f"[Eval WARNING] Non-finite loss={loss.item()} in {data_file}, skip batch.")
+                continue
+
+            total_loss += loss.item()
             total_batches += 1
 
     model.train()
-    return total_loss / max(1, total_batches)
+    if total_batches == 0:
+        print(f"[Eval WARNING] No valid batches for {data_file}, return NaN.")
+        return float("nan")
+
+    return total_loss / total_batches
 
 
 # ======================================================
@@ -108,6 +149,10 @@ def build_probe_buffer(
     import torch.nn.functional as F
 
     dataset = InstructionDataset(data_file, teacher_tokenizer, max_length=cfg.max_seq_len)
+    if len(dataset) == 0:
+        print(f"[SLSD WARNING] Empty dataset when building probe buffer: {data_file}")
+        return []
+
     loader = DataLoader(
         dataset,
         batch_size=1,
@@ -124,6 +169,7 @@ def build_probe_buffer(
             out = teacher_model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
             logits = out.logits  # [1, L, V]
 
+            # 这里仍沿用你原来的：用最后一个 token 的熵筛选
             probs = torch.softmax(logits[:, -1, :], dim=-1)
             entropy = -torch.sum(probs * torch.log(probs + 1e-12))
 
@@ -173,6 +219,8 @@ def train_one_task_with_slsd(
 ):
     os.makedirs(cfg.save_dir, exist_ok=True)
     os.makedirs("logs", exist_ok=True)
+
+    max_grad_norm = getattr(cfg, "max_grad_norm", 1.0)
 
     # --------------------------------------------------
     # 1. 加载模型 & tokenizer（第一次任务才从头加载）
@@ -241,6 +289,10 @@ def train_one_task_with_slsd(
     # 3. 数据加载
     # --------------------------------------------------
     dataset = InstructionDataset(data_file, tokenizer, max_length=cfg.max_seq_len)
+    if len(dataset) == 0:
+        print(f"[Train WARNING] Empty train dataset for {task_name}, skip training.")
+        return model, tokenizer
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.per_device_batch_size,
@@ -251,7 +303,6 @@ def train_one_task_with_slsd(
     # --------------------------------------------------
     # 4. 优化器：slow & fast LoRA 分开更新
     # --------------------------------------------------
-    # 我们只用 get_ds_lora_param_groups 返回 slow/fast 列表，然后自己构建两个 optimizer
     _, slow_params, fast_params = get_ds_lora_param_groups(
         model,
         lr_slow=cfg.lr_slow,
@@ -283,31 +334,72 @@ def train_one_task_with_slsd(
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # --- supervised loss（fast+slow 都会反向） ---
+            # 如果这一 batch 没有任何监督 token，跳过
+            if (batch["labels"] != -100).sum() == 0:
+                print(f"[WARN] All labels=-100 | skip batch | task={task_name}")
+                continue
+
+            # --- supervised loss ---
             out = model(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"],
             )
-            sup_loss = out.loss / cfg.gradient_accumulation_steps
+            sup_loss = out.loss
+
+            # 检查 loss 是否有限
+            if not torch.isfinite(sup_loss):
+                print(f"[WARN] Non-finite sup_loss={sup_loss.item()} | skip | task={task_name}, step={global_step}")
+                continue
+
+            # 梯度累积缩放
+            sup_loss = sup_loss / cfg.gradient_accumulation_steps
             sup_loss.backward()
+
+            # NaN 检查
+            if check_nan(sup_loss, model, task_name, global_step):
+                print(f"[NaN] Skip batch after sup_loss | task={task_name}, step={global_step}")
+                optimizer_fast.zero_grad()
+                optimizer_slow.zero_grad()
+                continue
 
             running_loss += sup_loss.item()
             running_steps += 1
 
-            # --- KD loss（只让 slow 分支再学一点） ---
-            if cfg.use_slsd and probe_buffer is not None and step % 10 == 0:
+            # --- KD loss（SLSD，对 slow 分支做轻量蒸馏） ---
+            if cfg.use_slsd and probe_buffer is not None and len(probe_buffer) > 0 and step % 10 == 0:
                 buf_ex = probe_buffer[step % len(probe_buffer)]
                 kd = kd_loss_from_buffer(model, buf_ex, device) * cfg.kd_lambda
-                kd.backward()
-                optimizer_slow.step()
-                optimizer_slow.zero_grad()
 
+                if not torch.isfinite(kd):
+                    print(f"[SLSD WARN] Non-finite kd={kd.item()} | skip kd | task={task_name}, step={global_step}")
+                else:
+                    kd.backward()
+
+                    if check_nan(kd, model, task_name, global_step):
+                        print(f"[NaN] Skip batch after KD | task={task_name}, step={global_step}")
+                        optimizer_fast.zero_grad()
+                        optimizer_slow.zero_grad()
+                        continue
+
+                    # 只对 slow 分支进行一次更新
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in slow_params if p.requires_grad],
+                        max_grad_norm,
+                    )
+                    optimizer_slow.step()
+                    optimizer_slow.zero_grad()
+
+            # --- fast 分支的梯度累积 & 更新 ---
             if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in fast_params if p.requires_grad],
+                    max_grad_norm,
+                )
                 optimizer_fast.step()
                 optimizer_fast.zero_grad()
                 global_step += 1
-                pbar.set_postfix({"loss": running_loss / running_steps})
+                pbar.set_postfix({"loss": running_loss / max(running_steps, 1)})
 
         avg = running_loss / max(running_steps, 1)
         with open(train_log, "a", encoding="utf-8") as f:
@@ -379,7 +471,7 @@ def main():
 
             with open(eval_log, "a", encoding="utf-8") as f:
                 f.write(json.dumps({
-                    "method": "ds_lora_slsd",   # 给自己的方法起个统一名字
+                    "method": "ds_lora_slsd",
                     "stage": task_name,
                     "eval_task": ev,
                     "loss": float(ev_loss),
