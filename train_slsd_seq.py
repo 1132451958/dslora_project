@@ -8,16 +8,99 @@
 
 import os
 import json
+import subprocess
 from copy import deepcopy
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch.nn.functional as F
 
 from configs.base_config import BaseConfig
 from utils_data import InstructionDataset, collate_fn
 from models.ds_lora import replace_with_ds_lora, get_ds_lora_param_groups
+
+
+# ======================================================
+# NaN Debug 工具（可选，用于排查问题）
+# ======================================================
+def debug_batch_nan(batch, model, tokenizer, task_name, global_step):
+    """
+    定位产生 NaN 的 batch：
+    - 检查 labels 的范围、unique 值
+    - 检查 logits 是否已经包含 inf / nan
+    """
+    labels = batch["labels"]           # [B, L]
+    input_ids = batch["input_ids"]     # [B, L]
+    attn_mask = batch["attention_mask"]
+
+    print("\n===== [NaN DEBUG] =====")
+    print(f"Task = {task_name}, step = {global_step}")
+    print("Batch size:", labels.size(0))
+    print("Seq length:", labels.size(1))
+
+    # 1) label 统计
+    valid_before = (labels != -100).sum(dim=-1)
+    shift_labels = labels[..., 1:].contiguous()
+    valid_after = (shift_labels != -100).sum(dim=-1)
+
+    print("valid_before_shift per sample:", valid_before.tolist())
+    print("valid_after_shift  per sample:", valid_after.tolist())
+    print("labels unique (first sample):", torch.unique(labels[0])[:20])
+    print("labels min/max (first sample):", labels[0].min().item(), labels[0].max().item())
+
+    # 2) 查看 logits 是否已经炸掉
+    model.eval()
+    with torch.no_grad():
+        out = model(input_ids=input_ids, attention_mask=attn_mask)
+        logits = out.logits    # [B, L, V]
+
+        isfinite = torch.isfinite(logits)
+        num_total = logits.numel()
+        num_finite = isfinite.sum().item()
+        num_nan = torch.isnan(logits).sum().item()
+        num_inf = torch.isinf(logits).sum().item()
+
+        print(f"logits finite ratio = {num_finite}/{num_total}")
+        print(f"logits num_nan = {num_nan}, num_inf = {num_inf}")
+        print("logits max/min (clipped to finite):")
+
+        finite_logits = logits[isfinite]
+        if finite_logits.numel() > 0:
+            print("  max =", finite_logits.max().item())
+            print("  min =", finite_logits.min().item())
+        else:
+            print("  all non-finite!")
+
+        # 3) 手算一次 CE loss 看是不是同样 NaN
+        try:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            loss_flat = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="none",
+            )
+            print("manual CE loss stats (ignoring -100):")
+            print("  has_nan =", torch.isnan(loss_flat).any().item())
+            print("  has_inf =", torch.isinf(loss_flat).any().item())
+            finite_loss_flat = loss_flat[torch.isfinite(loss_flat)]
+            if finite_loss_flat.numel() > 0:
+                print("  loss max =", finite_loss_flat.max().item())
+                print("  loss min =", finite_loss_flat.min().item())
+        except Exception as e:
+            print("[NaN DEBUG] manual CE loss computation raised error:", repr(e))
+
+    # 4) 打印一条样本的文本，帮助定位原始数据
+    text = tokenizer.decode(input_ids[0], skip_special_tokens=False)
+    print("Decoded sample[0] (truncated to 300 chars):")
+    print(text[:300], " ...")
+
+    print("===== END DEBUG =====\n")
+    model.train()
 
 
 # ======================================================
@@ -42,39 +125,59 @@ def check_nan(loss, model, task_name, global_step):
 
 
 # ======================================================
-# GPU 选择函数
+# GPU 选择函数（使用 nvidia-smi，不创建多卡 context）
 # ======================================================
 def select_device():
+    """
+    使用 nvidia-smi 查询每块 GPU 的空闲显存，只在最终选中的那张卡上创建 CUDA context。
+    不再对每张卡调用 torch.cuda.xxx，从而避免一个进程在所有 GPU 上都占 300+MiB。
+    """
     if not torch.cuda.is_available():
         print("[GPU SELECT] CUDA not available, using CPU.")
         return torch.device("cpu")
 
-    num_devices = torch.cuda.device_count()
-    best_idx = None
-    best_free = -1
+    try:
+        result = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free,memory.total,name",
+                "--format=csv,noheader,nounits",
+            ],
+            encoding="utf-8",
+        )
+        lines = [l.strip() for l in result.strip().splitlines() if l.strip()]
 
-    print("[GPU SELECT] Checking GPUs...")
+        print("[GPU SELECT] Checking GPUs via nvidia-smi...")
 
-    for i in range(num_devices):
-        name = torch.cuda.get_device_name(i)
-        total_bytes = torch.cuda.get_device_properties(i).total_memory
-        total_gb = total_bytes / 1024 ** 3
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info(i)
-            free_gb = free_bytes / 1024 ** 3
-        except RuntimeError:
-            free_bytes = 0
-            free_gb = 0
+        best_idx = None
+        best_free_mb = -1
 
-        print(f" - cuda:{i} | {name} | free={free_gb:.1f}GB / total={total_gb:.1f}GB")
+        for idx, line in enumerate(lines):
+            parts = [p.strip() for p in line.split(",")]
+            free_mb = int(parts[0])
+            total_mb = int(parts[1])
+            name = ",".join(parts[2:])
 
-        if free_bytes > best_free:
-            best_free = free_bytes
-            best_idx = i
+            free_gb = free_mb / 1024.0
+            total_gb = total_mb / 1024.0
+            print(f" - cuda:{idx} | {name} | free={free_gb:.1f}GB / total={total_gb:.1f}GB")
 
-    device = torch.device(f"cuda:{best_idx}")
-    print(f"[GPU SELECT] Using cuda:{best_idx}")
-    return device
+            if free_mb > best_free_mb:
+                best_free_mb = free_mb
+                best_idx = idx
+
+        if best_idx is None:
+            print("[GPU SELECT] nvidia-smi returned no GPUs, fallback to cuda:0")
+            return torch.device("cuda:0")
+
+        device = torch.device(f"cuda:{best_idx}")
+        print(f"[GPU SELECT] Using cuda:{best_idx}")
+        return device
+
+    except Exception as e:
+        print(f"[GPU SELECT] nvidia-smi query failed: {e}")
+        print("[GPU SELECT] Fallback: using cuda:0")
+        return torch.device("cuda:0")
 
 
 # ======================================================
@@ -145,9 +248,6 @@ def build_probe_buffer(
     entropy_threshold,
     device,
 ):
-    from math import log
-    import torch.nn.functional as F
-
     dataset = InstructionDataset(data_file, teacher_tokenizer, max_length=cfg.max_seq_len)
     if len(dataset) == 0:
         print(f"[SLSD WARNING] Empty dataset when building probe buffer: {data_file}")
@@ -169,7 +269,6 @@ def build_probe_buffer(
             out = teacher_model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"])
             logits = out.logits  # [1, L, V]
 
-            # 这里仍沿用你原来的：用最后一个 token 的熵筛选
             probs = torch.softmax(logits[:, -1, :], dim=-1)
             entropy = -torch.sum(probs * torch.log(probs + 1e-12))
 
@@ -189,8 +288,6 @@ def build_probe_buffer(
 
 
 def kd_loss_from_buffer(student_model, buf, device):
-    import torch.nn.functional as F
-
     ids = buf["input_ids"].to(device)
     att = buf["attention_mask"].to(device)
     teacher_logits = buf["logits"].to(device)
@@ -237,7 +334,7 @@ def train_one_task_with_slsd(
 
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name,
-            torch_dtype=torch.float16,
+            torch_dtype=torch.bfloat16,
         )
         model.resize_token_embeddings(len(tokenizer))
         model.to(device)
@@ -324,12 +421,19 @@ def train_one_task_with_slsd(
     # --------------------------------------------------
     global_step = 0
     model.zero_grad()
-    train_log = f"logs/seq_{task_name}_train_loss.jsonl"
+    # 按 step 记录：与 baseline 对齐
+    step_log = f"logs/seq_ds_lora_slsd_{task_name}_steps.jsonl"
+    # 按 epoch 记录平均 loss
+    epoch_log = f"logs/seq_{task_name}_train_loss.jsonl"
 
     for epoch in range(cfg.num_epochs):
         pbar = tqdm(loader, desc=f"{task_name} Epoch {epoch+1}")
-        running_loss = 0.0
+        running_loss = 0.0          # 累积的是 scaled sup_loss（除过 grad_acc）
         running_steps = 0
+        last_raw_loss = 0.0         # 最近一次原始 sup_loss（未缩放）
+
+        epoch_loss_sum = 0.0        # 用于按 epoch 统计 full loss
+        epoch_step_count = 0
 
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -347,12 +451,16 @@ def train_one_task_with_slsd(
             )
             sup_loss = out.loss
 
+            # 记录原始 loss（未除 gradient_accumulation_steps），用于打印/画图
+            last_raw_loss = sup_loss.detach().float().item()
+
             # 检查 loss 是否有限
             if not torch.isfinite(sup_loss):
-                print(f"[WARN] Non-finite sup_loss={sup_loss.item()} | skip | task={task_name}, step={global_step}")
+                print(f"[WARN] Non-finite sup_loss={sup_loss.item()} | task={task_name}, step={global_step}")
+                debug_batch_nan(batch, model, tokenizer, task_name, global_step)
                 continue
 
-            # 梯度累积缩放
+            # 梯度累积缩放（训练用 scaled loss）
             sup_loss = sup_loss / cfg.gradient_accumulation_steps
             sup_loss.backward()
 
@@ -399,11 +507,50 @@ def train_one_task_with_slsd(
                 optimizer_fast.step()
                 optimizer_fast.zero_grad()
                 global_step += 1
-                pbar.set_postfix({"loss": running_loss / max(running_steps, 1)})
 
-        avg = running_loss / max(running_steps, 1)
-        with open(train_log, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"epoch": epoch + 1, "avg_train_loss": float(avg)}) + "\n")
+                # scaled_loss 是平均的 scaled sup_loss
+                scaled_loss = running_loss / max(running_steps, 1)
+                # full_loss 恢复到“原始 loss”量级，与 baseline 的 loss 可对齐
+                full_loss = scaled_loss * cfg.gradient_accumulation_steps
+
+                # tqdm 显示：原始 loss + full_loss
+                pbar.set_postfix({
+                    "raw_loss": f"{last_raw_loss:.4f}",
+                    "loss": f"{full_loss:.4f}",
+                })
+
+                # 写 step 级别 log（与 baseline 风格一致，可直接画图对比）
+                with open(step_log, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "method": "ds_lora_slsd",
+                        "task": task_name,
+                        "epoch": epoch + 1,
+                        "step": global_step,
+                        "loss": float(full_loss),          # 用于对比
+                        "raw_loss": float(last_raw_loss),  # 额外保留一份原始 loss
+                    }) + "\n")
+
+                # 用于 epoch 级别统计
+                epoch_loss_sum += full_loss
+                epoch_step_count += 1
+
+                # 重置累计
+                running_loss = 0.0
+                running_steps = 0
+
+        # 一个 epoch 结束后，记录 epoch 平均 loss
+        if epoch_step_count > 0:
+            avg_epoch_loss = epoch_loss_sum / epoch_step_count
+        else:
+            avg_epoch_loss = 0.0
+
+        with open(epoch_log, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "epoch": epoch + 1,
+                "avg_train_loss": float(avg_epoch_loss),
+            }) + "\n")
+
+        print(f"[Epoch {epoch+1}] {task_name} avg_train_loss = {avg_epoch_loss:.4f}")
 
     return model, tokenizer
 

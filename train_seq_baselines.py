@@ -14,6 +14,7 @@ import argparse
 import random
 from copy import deepcopy
 
+import subprocess
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -85,36 +86,59 @@ def sanitize_generation_config(model):
 # GPU 选择
 # ======================================================
 def select_device():
+    """
+    使用 nvidia-smi 查询每块 GPU 的空闲显存，只在最终选中的那张卡上创建 CUDA context。
+    不再对每张卡调用 torch.cuda.xxx，从而避免一个进程在所有 GPU 上都占 300+MiB。
+    """
     if not torch.cuda.is_available():
         print("[GPU SELECT] CUDA not available, using CPU.")
         return torch.device("cpu")
 
-    num_devices = torch.cuda.device_count()
-    best_idx = None
-    best_free = -1
+    try:
+        # 用 nvidia-smi 查每块卡的 free / total 显存（单位 MiB）和名字
+        result = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free,memory.total,name",
+                "--format=csv,noheader,nounits",
+            ],
+            encoding="utf-8",
+        )
+        lines = [l.strip() for l in result.strip().splitlines() if l.strip()]
 
-    print("[GPU SELECT] Checking GPUs...")
-    for i in range(num_devices):
-        name = torch.cuda.get_device_name(i)
-        total_bytes = torch.cuda.get_device_properties(i).total_memory
-        total_gb = total_bytes / 1024 ** 3
+        print("[GPU SELECT] Checking GPUs via nvidia-smi...")
 
-        try:
-            free_bytes, _ = torch.cuda.mem_get_info(i)
-            free_gb = free_bytes / 1024 ** 3
-        except RuntimeError:
-            free_bytes = 0
-            free_gb = 0.0
+        best_idx = None
+        best_free_mb = -1
 
-        print(f" - cuda:{i} | {name} | free={free_gb:.1f}GB / total={total_gb:.1f}GB")
-        if free_bytes > best_free:
-            best_free = free_bytes
-            best_idx = i
+        for idx, line in enumerate(lines):
+            # 每行格式类似： "20000, 24564, NVIDIA GeForce RTX 4090"
+            parts = [p.strip() for p in line.split(",")]
+            free_mb = int(parts[0])
+            total_mb = int(parts[1])
+            name = ",".join(parts[2:])  # 防止名字里还有逗号
 
-    device = torch.device(f"cuda:{best_idx}")
-    print(f"[GPU SELECT] Using cuda:{best_idx}")
-    return device
+            free_gb = free_mb / 1024.0
+            total_gb = total_mb / 1024.0
+            print(f" - cuda:{idx} | {name} | free={free_gb:.1f}GB / total={total_gb:.1f}GB")
 
+            if free_mb > best_free_mb:
+                best_free_mb = free_mb
+                best_idx = idx
+
+        if best_idx is None:
+            print("[GPU SELECT] nvidia-smi returned no GPUs, fallback to cuda:0")
+            return torch.device("cuda:0")
+
+        device = torch.device(f"cuda:{best_idx}")
+        print(f"[GPU SELECT] Using cuda:{best_idx}")
+        return device
+
+    except Exception as e:
+        # 万一 nvidia-smi 出问题，就退回到简单策略
+        print(f"[GPU SELECT] nvidia-smi query failed: {e}")
+        print("[GPU SELECT] Fallback: using cuda:0")
+        return torch.device("cuda:0")
 
 # ======================================================
 # Eval：平均 loss
